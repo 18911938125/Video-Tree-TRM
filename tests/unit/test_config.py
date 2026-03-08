@@ -28,9 +28,12 @@ _FULL_YAML = {
         "cache_dir": "cache/trees",
     },
     "embed": {
+        "backend": "local",
         "model_name": "test-model",
-        "embed_dim": 768,
+        "embed_dim": 2560,
         "device": "cpu",
+        "api_key": "",
+        "api_url": "",
     },
     "llm": {
         "backend": "qwen",
@@ -49,7 +52,7 @@ _FULL_YAML = {
         "temperature": 0.1,
     },
     "retriever": {
-        "embed_dim": 768,
+        "embed_dim": 2560,
         "num_heads": 4,
         "L_layers": 2,
         "L_cycles": 4,
@@ -96,6 +99,10 @@ def env_path(tmp_path: Path) -> Path:
         "VLM_API_KEY=env-vlm-key\n"
         "VLM_MODEL=env-vlm-model\n"
         "VLM_API_URL=https://env.example.com/vlm\n"
+        "EMBED_BACKEND=remote\n"
+        "EMBED_MODEL=env-embed-model\n"
+        "EMBED_API_KEY=env-embed-key\n"
+        "EMBED_API_URL=https://env.example.com/embed\n"
     )
     return p
 
@@ -116,7 +123,7 @@ class TestYAMLLoad:
         assert isinstance(cfg.tree, TreeConfig)
         assert cfg.tree.max_paragraphs_per_l2 == 5
         assert cfg.tree.l1_segment_duration == 600.0
-        assert cfg.embed.embed_dim == 768
+        assert cfg.embed.embed_dim == 2560
         assert cfg.retriever.checkpoint is None
         assert cfg.train.dataset == "longbench"
 
@@ -178,6 +185,14 @@ class TestEnvOverride:
         assert cfg.vlm.api_key == "env-vlm-key"
         assert cfg.vlm.model == "env-vlm-model"
         assert cfg.vlm.api_url == "https://env.example.com/vlm"
+
+    def test_env_overrides_embed(self, yaml_path: Path, env_path: Path) -> None:
+        """embed 相关字段应优先使用 .env 中的值。"""
+        cfg = Config.load(str(yaml_path), env_path=str(env_path))
+        assert cfg.embed.backend == "remote"
+        assert cfg.embed.model_name == "env-embed-model"
+        assert cfg.embed.api_key == "env-embed-key"
+        assert cfg.embed.api_url == "https://env.example.com/embed"
 
     def test_yaml_fallback_when_no_env(self, yaml_path: Path) -> None:
         """无 .env 时应使用 YAML 中的值。"""
