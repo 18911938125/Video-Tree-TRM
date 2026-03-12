@@ -33,7 +33,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
 CONDA_ENV="${CONDA_ENV:-Video-Tree-TRM}"
-DATA_DIR="${DATA_DIR:-/data/videomme}"
+DATA_DIR="${DATA_DIR:-${PROJECT_ROOT}/data/videomme}"
 VIDEO_DIR="${DATA_DIR}/videos"
 META_DIR="${DATA_DIR}/metadata"
 TREE_DIR="${DATA_DIR}/trees"

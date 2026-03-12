@@ -55,7 +55,7 @@ def main() -> None:
 
     try:
         # VideoMME 数据集，test split
-        ds = load_dataset("lmms-lab/Video-MME", split="test", trust_remote_code=True)
+        ds = load_dataset("lmms-lab/Video-MME", split="test")
     except Exception as e:
         print(f"[meta][ERROR] 数据集加载失败: {e}", file=sys.stderr)
         print("[meta] 请确认 HuggingFace 可访问，或配置 HF_ENDPOINT 镜像", file=sys.stderr)
@@ -71,27 +71,32 @@ def main() -> None:
     long_qa: list[dict] = []
 
     for row in ds:
-        # duration_category 字段: "short" / "medium" / "long"
-        duration = row.get("duration", 0)
-        duration_category = row.get("duration_category", "")
-        is_long = (
-            duration_category == "long"
-            or args.min_duration <= duration <= args.max_duration
-        )
-        if not is_long:
+        # 实际字段结构（lmms-lab/Video-MME 真实格式）:
+        #   video_id      : "001", "002", ... （数据集内部序号）
+        #   videoID       : YouTube 视频 ID（如 "fFjv93ACGo8"）
+        #   url           : YouTube 完整链接
+        #   duration      : "short" | "medium" | "long"（字符串类别，非秒数）
+        #   domain        : 领域
+        #   sub_category  : 细分类别
+        #   question_id   : 问题序号
+        #   question      : 问题文本
+        #   options       : 选项列表（字符串）
+        #   answer        : 正确选项字母
+        duration_category = str(row.get("duration", "")).strip().lower()
+        if duration_category != "long":
             continue
 
-        video_id = row.get("video_id") or row.get("youtube_id", "")
+        youtube_id = row.get("videoID") or row.get("video_id", "")
+        url = row.get("url", f"https://www.youtube.com/watch?v={youtube_id}")
 
-        # 唯一视频记录
-        if video_id not in seen_video_ids:
-            seen_video_ids.add(video_id)
+        # 唯一视频记录（以 youtube_id 去重）
+        if youtube_id not in seen_video_ids:
+            seen_video_ids.add(youtube_id)
             long_videos.append(
                 {
-                    "video_id": video_id,
-                    "youtube_id": row.get("youtube_id", video_id),
-                    "url": row.get("url", f"https://www.youtube.com/watch?v={video_id}"),
-                    "duration": duration,
+                    "video_id": row.get("video_id", ""),
+                    "youtube_id": youtube_id,
+                    "url": url,
                     "duration_category": duration_category,
                     "domain": row.get("domain", ""),
                     "sub_category": row.get("sub_category", ""),
@@ -101,12 +106,13 @@ def main() -> None:
         # QA 对记录
         long_qa.append(
             {
-                "video_id": video_id,
-                "youtube_id": row.get("youtube_id", video_id),
+                "video_id": row.get("video_id", ""),
+                "youtube_id": youtube_id,
+                "question_id": row.get("question_id", ""),
                 "question": row.get("question", ""),
                 "answer": row.get("answer", ""),
                 "options": row.get("options", []),
-                "duration": duration,
+                "duration_category": duration_category,
             }
         )
 

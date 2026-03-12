@@ -4,7 +4,7 @@ tree:
   l2_clip_duration: 60.0               # L2: 每 clip 60 秒
   l3_fps: 1.0                          # L3: 1 帧/秒
   l2_representative_frames: 10         # L2 VLM 描述用的代表帧数
-  cache_dir: "/data/videomme/trees"    # 树索引缓存目录（绝对路径）
+  cache_dir: "data/videomme/trees"     # 树索引缓存目录（相对项目根目录）
 
 embed:
   backend: "local"                     # "local"（sentence-transformers）| "remote"
@@ -50,6 +50,6 @@ train:
   act_lambda_step: 0.1
   act_gamma: 0.9
   eval_interval: 5
-  save_dir: "/data/videomme/checkpoints"
+  save_dir: "data/videomme/checkpoints"
   dataset: "videomme"
-  dataset_path: "/data/videomme/annotations"
+  dataset_path: "data/videomme/metadata"
