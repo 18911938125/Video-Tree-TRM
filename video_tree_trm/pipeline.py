@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+from typing import Optional
 
 import torch
 
@@ -97,21 +98,20 @@ class Pipeline:
         )
 
     def build_index(self, source_path: str, modality: str) -> TreeIndex:
-        """构建并缓存 TreeIndex。
+        """构建并缓存 TreeIndex（JSON 格式，仅含文字描述，无 embedding）。
 
         参数:
             source_path: 原始文件路径（文本文件或视频文件）。
             modality:    模态类型，"text" 或 "video"。
 
         返回:
-            构建完成的 TreeIndex 对象。
+            构建完成的 TreeIndex 对象（embedding=None，查询时按需 embed）。
 
         实现细节:
-            - 缓存路径: ``{cache_dir}/{stem}_{modality}.pkl``。
+            - 缓存路径: ``{cache_dir}/{stem}_{modality}.json``。
             - 缓存命中时直接反序列化返回，不重新构建。
-            - 缓存未命中时构建后序列化保存到磁盘。
-            - 文本模式读取文件内容后调用 TextTreeBuilder；
-              视频模式直接将路径传给 VideoTreeBuilder。
+            - 缓存未命中时调用 VLM 生成描述文本，保存为 JSON。
+            - 不在 build 阶段执行 embedding（embedding 在 query 时按需计算）。
         """
         ensure(
             modality in ("text", "video"),
@@ -122,13 +122,13 @@ class Pipeline:
         stem = Path(source_path).stem
         cache_dir = Path(self.config.tree.cache_dir)
         cache_dir.mkdir(parents=True, exist_ok=True)
-        cache_path = str(cache_dir / f"{stem}_{modality}.pkl")
+        cache_path = str(cache_dir / f"{stem}_{modality}.json")
 
         if os.path.isfile(cache_path):
             log_msg("INFO", "缓存命中，直接加载 TreeIndex", cache_path=cache_path)
-            return TreeIndex.load(cache_path)
+            return TreeIndex.load_json(cache_path)
 
-        # Phase 2: 构建树索引
+        # Phase 2: 构建树索引（纯 VLM 文字描述，无 embedding）
         log_msg(
             "INFO",
             "缓存未命中，开始构建 TreeIndex",
@@ -139,17 +139,41 @@ class Pipeline:
         if modality == "text":
             with open(source_path, encoding="utf-8") as f:
                 text = f.read()
-            builder = TextTreeBuilder(self.embed_model, self.llm, self.config.tree)
+            builder = TextTreeBuilder(self.llm, self.config.tree)
             tree = builder.build(text, source_path)
         else:
-            builder = VideoTreeBuilder(self.embed_model, self.vlm, self.config.tree)
+            builder = VideoTreeBuilder(self.vlm, self.config.tree)
             tree = builder.build(source_path)
 
-        # Phase 3: 保存缓存
-        tree.save(cache_path)
-        log_msg("INFO", "TreeIndex 已缓存", cache_path=cache_path)
+        # Phase 3: 保存为 JSON（无 embedding）
+        tree.save_json(cache_path)
+        log_msg("INFO", "TreeIndex 已缓存（JSON，无 embedding）", cache_path=cache_path)
 
         return tree
+
+    def _embed_tree(self, tree: TreeIndex, cache_path: Optional[str] = None) -> None:
+        """对树的所有节点执行 embedding（内存中），可选回写缓存。
+
+        参数:
+            tree: 待 embed 的 TreeIndex（embedding=None 的节点）。
+            cache_path: 若非 None，embed 完成后回写到此路径（JSON 格式）；
+                        为 None 时仅在内存中填充 embedding，不写磁盘。
+
+        实现细节:
+            调用 TreeIndex.embed_all，传入 EmbeddingModel.embed 作为 embed_fn。
+            embed_all 内部按 L2 分组批量处理 L3，减少 API 调用次数。
+        """
+        log_msg("INFO", "开始对树执行 embedding（内存）")
+        tree.embed_all(
+            embed_fn=self.embed_model.embed,
+            model_name=self.config.embed.model_name,
+            embed_dim=self.embed_model.dim,
+        )
+        if cache_path is not None:
+            tree.save_json(cache_path)
+            log_msg("INFO", "embed_all 完成，缓存已更新", cache_path=cache_path)
+        else:
+            log_msg("INFO", "embed_all 完成（仅内存，未写磁盘）")
 
     def query(self, question: str, tree: TreeIndex) -> str:
         """对已有 TreeIndex 执行问答，返回生成答案。
@@ -166,6 +190,11 @@ class Pipeline:
             - 检索器在 torch.no_grad() 上下文中运行，避免梯度计算开销。
             - generator.generate 接收 result["paths"]（List[Tuple[int,int,int]]）。
         """
+        # Phase 0: 确保树已 embed（JSON 加载后 embedding=None，在内存中按需计算）
+        if not tree.is_embedded:
+            log_msg("INFO", "树尚未 embed，触发内存 embed_all")
+            self._embed_tree(tree, cache_path=None)
+
         # Phase 1: 嵌入查询
         q: torch.Tensor = self.embed_model.embed_tensor(question)  # [1, D]
 

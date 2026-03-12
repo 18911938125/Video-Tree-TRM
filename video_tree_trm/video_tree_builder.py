@@ -32,6 +32,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import subprocess
 from datetime import datetime
 from pathlib import Path
 from typing import List, Optional, Tuple
@@ -41,7 +42,6 @@ import numpy as np
 
 from utils.logger_system import ensure, log_json, log_msg
 from video_tree_trm.config import TreeConfig
-from video_tree_trm.embeddings import EmbeddingModel
 from video_tree_trm.llm_client import LLMClient
 from video_tree_trm.tree_index import (
     IndexMeta,
@@ -81,32 +81,130 @@ class VideoTreeBuilder:
     """视频模态树构建器。
 
     将长视频通过 L2 轴心策略（先构建 L2，再向下扩展 L3，向上聚合 L1）
-    转化为三层 TreeIndex。所有描述通过 VLM 生成，所有嵌入使用 text_embed。
+    转化为三层 TreeIndex。所有描述通过 VLM 生成，节点 embedding 均为 None（由 Pipeline.embed_all 延迟填充）。
 
     属性:
-        embed: 嵌入模型（冻结）。
         vlm: VLM/LLM 客户端（用于图文和纯文本调用）。
         config: 树构建配置。
     """
 
     def __init__(
         self,
-        embed_model: EmbeddingModel,
         vlm: LLMClient,
         config: TreeConfig,
     ) -> None:
         """初始化视频树构建器。
 
         参数:
-            embed_model: 已初始化的嵌入模型（EmbeddingModel）。
             vlm: 已初始化的 VLM/LLM 客户端（LLMClient），需支持 chat_with_images。
             config: 树构建配置（TreeConfig），关键字段：
                     l1_segment_duration, l2_clip_duration, l3_fps,
                     l2_representative_frames, cache_dir。
+
+        实现细节:
+            构建器不持有 EmbeddingModel，所有 embedding 延迟到检索阶段由 Pipeline 统一计算。
         """
-        self.embed = embed_model
         self.vlm = vlm
         self.config = config
+
+    # ------------------------------------------------------------------
+    # URL 流式辅助方法
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _is_url(path_or_url: str) -> bool:
+        """判断输入是否为网络 URL（而非本地路径）。
+
+        参数:
+            path_or_url: 文件路径或 URL 字符串。
+
+        返回:
+            True 表示 URL，False 表示本地路径。
+        """
+        return path_or_url.startswith(("http://", "https://"))
+
+    @staticmethod
+    def _source_stem(video_path: str) -> str:
+        """从视频路径或 YouTube URL 中提取短标识符，用于帧缓存目录命名。
+
+        参数:
+            video_path: 本地文件路径或 YouTube 视频页面 URL。
+
+        返回:
+            短字符串标识符（本地文件取 stem，YouTube URL 取 v= 后的视频 ID）。
+
+        实现细节:
+            YouTube URL 格式: https://www.youtube.com/watch?v=VIDEO_ID
+            CDN 直链（stream_url）不应传入此方法，应传入原始 video_path。
+        """
+        if "youtube.com/watch" in video_path or "youtu.be/" in video_path:
+            # 提取 v= 参数
+            match = re.search(r"(?:v=|youtu\.be/)([A-Za-z0-9_-]{8,15})", video_path)
+            if match:
+                return match.group(1)
+        # 本地文件或其他 URL 取文件名 stem，限制最大长度避免文件名过长
+        stem = Path(video_path).stem
+        return stem[:64] if len(stem) > 64 else stem
+
+    @staticmethod
+    def _resolve_stream(url: str) -> str:
+        """通过 yt-dlp 获取 YouTube 视频的 CDN 直链，供 cv2.VideoCapture 直接使用。
+
+        参数:
+            url: YouTube 视频页面 URL。
+
+        返回:
+            CDN HTTPS 直链（ffmpeg/OpenCV 可直接流式读取）。
+
+        实现细节:
+            调用 yt-dlp -g 获取最佳 mp4 格式直链，仅请求元数据不下载内容。
+        """
+        log_msg("INFO", "获取 YouTube CDN 直链", url=url)
+        result = subprocess.run(
+            [
+                "yt-dlp",
+                "-g",
+                "--format",
+                "best[ext=mp4][height<=720]/best[ext=mp4]/best",
+                url,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        ensure(result.returncode == 0, f"yt-dlp 获取直链失败: {result.stderr.strip()}")
+        stream_url = result.stdout.strip().splitlines()[0]
+        ensure(stream_url.startswith("http"), f"yt-dlp 返回非 URL: {stream_url[:100]}")
+        log_msg("INFO", "CDN 直链获取成功", stream_url=stream_url[:80])
+        return stream_url
+
+    @staticmethod
+    def _get_video_duration(url: str) -> float:
+        """通过 yt-dlp --dump-json 获取视频时长（秒）。
+
+        参数:
+            url: YouTube 视频页面 URL。
+
+        返回:
+            视频总时长（秒，浮点数）。
+
+        实现细节:
+            对 HTTP 流 cv2.CAP_PROP_FRAME_COUNT 常返回 -1 或 0，
+            使用 yt-dlp 元数据获取准确时长。
+        """
+        log_msg("INFO", "获取视频时长元数据", url=url)
+        result = subprocess.run(
+            ["yt-dlp", "--dump-json", "--no-playlist", url],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        ensure(result.returncode == 0, f"yt-dlp 元数据获取失败: {result.stderr.strip()}")
+        meta = json.loads(result.stdout)
+        duration = float(meta.get("duration", 0))
+        ensure(duration > 0, f"视频时长读取异常: {duration}")
+        log_msg("INFO", "视频时长确认", duration_sec=round(duration, 1))
+        return duration
 
     # ------------------------------------------------------------------
     # 公共接口
@@ -116,23 +214,36 @@ class VideoTreeBuilder:
         """将长视频构建为三层 TreeIndex。
 
         参数:
-            video_path: 输入视频文件路径（支持 .mp4/.avi/.mkv 等 OpenCV 可读格式）。
+            video_path: 视频文件路径（.mp4/.avi/.mkv 等）或 YouTube URL。
+                        传入 URL 时通过 yt-dlp 获取 CDN 直链后流式读取，无需下载。
 
         返回:
             三层 TreeIndex 对象。
 
         实现细节:
+            Step 0: 若 video_path 为 URL，获取 CDN 直链（stream_url）和时长（duration_hint）
             Step 1: _segment_video → List[Tuple[float, float]]（L1 时间区间）
             Step 2: L2 先行 — 每个 L2 clip 用 VLM 生成描述 + 嵌入
             Step 3: L3 向下 — 注入 L2 上下文，VLM 批量帧描述 + 嵌入
             Step 4: L1 向上 — 聚合 L2 描述，LLM 生成 L1 摘要 + 嵌入
             Step 5: 组装 TreeIndex 并写入日志
         """
-        ensure(os.path.isfile(video_path), f"视频文件不存在: {video_path}")
-        log_msg("INFO", "开始构建视频树索引", video_path=video_path)
+        # Phase 0: URL vs 本地文件处理
+        if self._is_url(video_path):
+            stream_url = self._resolve_stream(video_path)
+            duration_hint: Optional[float] = self._get_video_duration(video_path)
+            log_msg("INFO", "开始构建视频树索引（URL 流式模式）", source_url=video_path)
+        else:
+            ensure(os.path.isfile(video_path), f"视频文件不存在: {video_path}")
+            stream_url = video_path
+            duration_hint = None
+            log_msg("INFO", "开始构建视频树索引", video_path=video_path)
+
+        # 计算帧目录用的短标识符（从原始 video_path 而非 stream_url 提取）
+        source_id = self._source_stem(video_path)
 
         # Phase 1: 时间切分 → L1 区间列表
-        l1_ranges = self._segment_video(video_path)
+        l1_ranges = self._segment_video(stream_url, duration_hint=duration_hint)
         ensure(len(l1_ranges) > 0, "视频时间切分结果为空")
         log_msg("INFO", "视频切分完成", l1_count=len(l1_ranges))
 
@@ -146,11 +257,11 @@ class VideoTreeBuilder:
                 l2_id = f"l1_{i}_l2_{j}"
 
                 # Phase 2: L2 先行 — VLM 代表帧描述
-                l2_node = self._build_l2_video(video_path, clip_range, l2_id)
+                l2_node = self._build_l2_video(stream_url, clip_range, l2_id, source_id=source_id)
 
                 # Phase 3: L3 向下 — 提取所有帧，注入 L2 上下文
                 all_frames = self._extract_frames(
-                    video_path, clip_range, self.config.l3_fps
+                    stream_url, clip_range, self.config.l3_fps, source_id=source_id
                 )
                 l3_nodes = self._build_l3_video(all_frames, l2_node.description, i, j)
                 l2_node.children = l3_nodes
@@ -167,12 +278,10 @@ class VideoTreeBuilder:
             l1_nodes.append(l1_node)
             log_msg("INFO", "L1 节点构建完成", l1_id=f"l1_{i}", l2_count=len(l2_nodes))
 
-        # Phase 5: 组装 TreeIndex
+        # Phase 5: 组装 TreeIndex（embedding 延迟到 Pipeline.embed_all，此处为 None）
         metadata = IndexMeta(
             source_path=video_path,
             modality="video",
-            embed_model=self.embed._model_name,
-            embed_dim=self.embed.dim,
             created_at=datetime.now().isoformat(),
         )
         index = TreeIndex(metadata=metadata, roots=l1_nodes)
@@ -186,7 +295,7 @@ class VideoTreeBuilder:
                 "l1_count": len(l1_nodes),
                 "l2_count": total_l2,
                 "l3_count": total_l3,
-                "embed_dim": self.embed.dim,
+                "embedded": False,
             },
         )
         log_msg(
@@ -202,31 +311,40 @@ class VideoTreeBuilder:
     # 内部方法：时间切分
     # ------------------------------------------------------------------
 
-    def _segment_video(self, video_path: str) -> List[Tuple[float, float]]:
+    def _segment_video(
+        self,
+        video_path: str,
+        duration_hint: Optional[float] = None,
+    ) -> List[Tuple[float, float]]:
         """读取视频总时长，按固定步长切分为 L1 时间区间列表。
 
         参数:
-            video_path: 视频文件路径。
+            video_path: 视频文件路径或 CDN 流式 URL。
+            duration_hint: 已知视频时长（秒）。传入时跳过 cv2 读取，
+                           用于 HTTP 流（CAP_PROP_FRAME_COUNT 在流上返回 -1）。
 
         返回:
             L1 时间区间列表，每项为 (start_sec, end_sec)。
             最后一段可能短于 l1_segment_duration。
 
         实现细节:
-            使用 cv2.VideoCapture 读取总帧数和 FPS 计算总时长，
-            按 config.l1_segment_duration 固定步长切分。
+            本地文件: 使用 cv2.VideoCapture 读取总帧数和 FPS 计算总时长。
+            HTTP 流: 使用 duration_hint（由 yt-dlp --dump-json 获取），
+                    避免 CAP_PROP_FRAME_COUNT 在流上不可靠的问题。
         """
-        cap = cv2.VideoCapture(video_path)
-        ensure(cap.isOpened(), f"无法打开视频文件: {video_path}")
+        if duration_hint is not None:
+            total_duration = duration_hint
+        else:
+            cap = cv2.VideoCapture(video_path)
+            ensure(cap.isOpened(), f"无法打开视频文件: {video_path}")
 
-        fps = cap.get(cv2.CAP_PROP_FPS)
-        total_frames = cap.get(cv2.CAP_PROP_FRAME_COUNT)
-        cap.release()
+            fps = cap.get(cv2.CAP_PROP_FPS)
+            total_frames = cap.get(cv2.CAP_PROP_FRAME_COUNT)
+            cap.release()
 
-        ensure(fps > 0, f"视频 FPS 读取异常: {fps}")
-        ensure(total_frames > 0, f"视频总帧数读取异常: {total_frames}")
-
-        total_duration = total_frames / fps
+            ensure(fps > 0, f"视频 FPS 读取异常: {fps}")
+            ensure(total_frames > 0, f"视频总帧数读取异常: {total_frames}")
+            total_duration = total_frames / fps
         step = self.config.l1_segment_duration
         ranges: List[Tuple[float, float]] = []
 
@@ -275,23 +393,26 @@ class VideoTreeBuilder:
         video_path: str,
         time_range: Tuple[float, float],
         fps: float,
+        source_id: Optional[str] = None,
     ) -> List[Tuple[str, float]]:
         """按指定 fps 提取时间范围内的帧，保存到 cache 目录。
 
         参数:
-            video_path: 视频文件路径。
+            video_path: 视频文件路径或 CDN 流式 URL。
             time_range: 提取时间区间 (start_sec, end_sec)。
             fps: 提取帧率（帧/秒）。
+            source_id: 帧缓存目录名（若为 None 则从 video_path 提取 stem）。
+                       传入 URL 时应显式提供（避免文件名过长）。
 
         返回:
             [(frame_path, timestamp_sec), ...]，按时间顺序排列。
             已存在的帧文件直接复用，不重复提取。
 
         实现细节:
-            帧保存路径: {cache_dir}/frames/{video_stem}/{start:.1f}_{ts:.3f}.jpg
+            帧保存路径: {cache_dir}/frames/{source_id}/{start:.1f}_{ts:.3f}.jpg
             使用 cv2.VideoCapture.set(CAP_PROP_POS_MSEC) 精确定位帧位置。
         """
-        video_stem = Path(video_path).stem
+        video_stem = source_id if source_id is not None else self._source_stem(video_path)
         frame_dir = Path(self.config.cache_dir) / "frames" / video_stem
         frame_dir.mkdir(parents=True, exist_ok=True)
 
@@ -358,13 +479,15 @@ class VideoTreeBuilder:
         video_path: str,
         clip_range: Tuple[float, float],
         l2_id: str,
+        source_id: Optional[str] = None,
     ) -> L2Node:
         """构建 L2 视频节点（代表帧 VLM 描述 + 嵌入）。
 
         参数:
-            video_path: 视频文件路径。
+            video_path: 视频文件路径或 CDN 流式 URL。
             clip_range: L2 clip 时间区间 (start, end)，单位秒。
             l2_id: 节点 ID。
+            source_id: 帧缓存目录名（若为 None 则从 video_path 提取 stem）。
 
         返回:
             L2Node（children 为空，由调用方填充）。
@@ -384,7 +507,7 @@ class VideoTreeBuilder:
             step = (end_sec - start_sec) / (n_rep - 1)
             timestamps = [start_sec + i * step for i in range(n_rep)]
 
-        video_stem = Path(video_path).stem
+        video_stem = source_id if source_id is not None else self._source_stem(video_path)
         frame_dir = Path(self.config.cache_dir) / "frames" / video_stem
         frame_dir.mkdir(parents=True, exist_ok=True)
 
@@ -407,15 +530,10 @@ class VideoTreeBuilder:
         ensure(len(rep_frames) > 0, f"L2 节点 {l2_id} 代表帧提取结果为空")
 
         description = self.vlm.chat_with_images(_L2_VIDEO_PROMPT, images=rep_frames)
-        embedding = self.embed.embed(description)[0]  # [D]
-        ensure(
-            embedding.shape == (self.embed.dim,),
-            f"L2 嵌入维度异常: {embedding.shape}，期望 ({self.embed.dim},)",
-        )
         return L2Node(
             id=l2_id,
             description=description,
-            embedding=embedding.astype(np.float32),
+            embedding=None,
             time_range=clip_range,
         )
 
@@ -456,22 +574,14 @@ class VideoTreeBuilder:
         # Phase 1: 尝试批量调用 VLM
         descriptions = self._call_vlm_batch(prompt, frame_paths, n, l1_i, l2_j)
 
-        # Phase 2: 批量嵌入所有帧描述
-        embeddings = self.embed.embed(descriptions)  # [N, D]
-        ensure(
-            embeddings.shape == (n, self.embed.dim),
-            f"L3 嵌入矩阵形状异常: {embeddings.shape}，期望 ({n}, {self.embed.dim})",
-        )
-
+        # Phase 2: 构建 L3 节点（embedding=None，延迟到 embed_all）
         nodes: List[L3Node] = []
-        for k, (desc, emb, (frame_path, ts)) in enumerate(
-            zip(descriptions, embeddings, frames)
-        ):
+        for k, (desc, (frame_path, ts)) in enumerate(zip(descriptions, frames)):
             nodes.append(
                 L3Node(
                     id=f"l1_{l1_i}_l2_{l2_j}_l3_{k}",
                     description=desc,
-                    embedding=emb.astype(np.float32),
+                    embedding=None,
                     raw_content=None,
                     frame_path=frame_path,
                     timestamp=ts,
@@ -585,15 +695,10 @@ class VideoTreeBuilder:
         l2_texts = "\n".join(f"- {node.description}" for node in l2_children)
         prompt = _L1_VIDEO_PROMPT.format(l2_texts=l2_texts)
         summary = self.vlm.chat(prompt)
-        embedding = self.embed.embed(summary)[0]  # [D]
-        ensure(
-            embedding.shape == (self.embed.dim,),
-            f"L1 嵌入维度异常: {embedding.shape}，期望 ({self.embed.dim},)",
-        )
         return L1Node(
             id=l1_id,
             summary=summary,
-            embedding=embedding.astype(np.float32),
+            embedding=None,
             time_range=l1_range,
             children=l2_children,
         )

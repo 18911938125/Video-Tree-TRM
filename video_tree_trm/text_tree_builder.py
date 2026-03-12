@@ -34,7 +34,6 @@ import numpy as np
 
 from utils.logger_system import ensure, log_json, log_msg
 from video_tree_trm.config import TreeConfig
-from video_tree_trm.embeddings import EmbeddingModel
 from video_tree_trm.llm_client import LLMClient
 from video_tree_trm.tree_index import (
     IndexMeta,
@@ -90,28 +89,27 @@ class TextTreeBuilder:
     """文本模态树构建器。
 
     将长文本通过 L2 轴心策略（先构建 L2，再向下扩展 L3，向上聚合 L1）
-    转化为三层 TreeIndex。
+    转化为三层 TreeIndex。节点 embedding 均为 None（由 Pipeline.embed_all 延迟填充）。
 
     属性:
-        embed: 嵌入模型（冻结）。
         llm: LLM 客户端。
         config: 树构建配置。
     """
 
     def __init__(
         self,
-        embed_model: EmbeddingModel,
         llm: LLMClient,
         config: TreeConfig,
     ) -> None:
         """初始化文本树构建器。
 
         参数:
-            embed_model: 已初始化的嵌入模型（EmbeddingModel）。
             llm: 已初始化的 LLM 客户端（LLMClient）。
             config: 树构建配置（TreeConfig），关键字段 max_paragraphs_per_l2。
+
+        实现细节:
+            构建器不持有 EmbeddingModel，所有 embedding 延迟到检索阶段由 Pipeline 统一计算。
         """
-        self.embed = embed_model
         self.llm = llm
         self.config = config
 
@@ -177,12 +175,11 @@ class TextTreeBuilder:
             for j, group in enumerate(groups):
                 idx = group_index[(i, j)]
                 desc = l2_descs[idx]
-                emb = self.embed.embed(desc)[0]  # [D]
                 l3_nodes = self._build_l3_from_paragraphs(group, i, j)
                 l2_node = L2Node(
                     id=f"l1_{i}_l2_{j}",
                     description=desc,
-                    embedding=emb,
+                    embedding=None,
                     time_range=None,
                     children=l3_nodes,
                 )
@@ -191,12 +188,10 @@ class TextTreeBuilder:
             l1_node = self._build_l1(l2_nodes, f"l1_{i}")
             l1_nodes.append(l1_node)
 
-        # Phase 5: 组装 TreeIndex
+        # Phase 5: 组装 TreeIndex（embedding 延迟到 Pipeline.embed_all，此处为 None）
         metadata = IndexMeta(
             source_path=source_path,
             modality="text",
-            embed_model=self.embed._model_name,
-            embed_dim=self.embed.dim,
             created_at=datetime.now().isoformat(),
         )
         index = TreeIndex(metadata=metadata, roots=l1_nodes)
@@ -212,7 +207,7 @@ class TextTreeBuilder:
                 "l1_count": len(l1_nodes),
                 "l2_count": total_l2,
                 "l3_count": total_l3,
-                "embed_dim": self.embed.dim,
+                "embedded": False,
             },
         )
         log_msg(
@@ -401,15 +396,10 @@ class TextTreeBuilder:
         ensure(len(paragraphs) > 0, f"L2 节点 {l2_id} 的段落列表为空")
         prompt = _L2_PROMPT.format(text="\n\n".join(paragraphs))
         description = self.llm.chat(prompt)
-        embedding = self.embed.embed(description)[0]  # [D]
-        ensure(
-            embedding.shape == (self.embed.dim,),
-            f"L2 嵌入维度异常: {embedding.shape}，期望 ({self.embed.dim},)",
-        )
         return L2Node(
             id=l2_id,
             description=description,
-            embedding=embedding,
+            embedding=None,
             time_range=None,
         )
 
@@ -433,18 +423,13 @@ class TextTreeBuilder:
             使用 embed.embed(paragraphs) 批量嵌入，一次调用获取全部向量。
         """
         ensure(len(paragraphs) > 0, f"L3 段落列表为空 (l1={l1_i}, l2={l2_j})")
-        embeddings = self.embed.embed(paragraphs)  # [N, D]
-        ensure(
-            embeddings.shape == (len(paragraphs), self.embed.dim),
-            f"L3 嵌入矩阵形状异常: {embeddings.shape}",
-        )
         nodes: List[L3Node] = []
-        for k, (para, emb) in enumerate(zip(paragraphs, embeddings)):
+        for k, para in enumerate(paragraphs):
             nodes.append(
                 L3Node(
                     id=f"l1_{l1_i}_l2_{l2_j}_l3_{k}",
                     description=para,
-                    embedding=emb.astype(np.float32),
+                    embedding=None,
                     raw_content=para,
                     frame_path=None,
                     timestamp=None,
@@ -472,15 +457,10 @@ class TextTreeBuilder:
         )
         prompt = _L1_PROMPT.format(l2_descriptions=l2_descriptions)
         summary = self.llm.chat(prompt)
-        embedding = self.embed.embed(summary)[0]  # [D]
-        ensure(
-            embedding.shape == (self.embed.dim,),
-            f"L1 嵌入维度异常: {embedding.shape}，期望 ({self.embed.dim},)",
-        )
         return L1Node(
             id=l1_id,
             summary=summary,
-            embedding=embedding,
+            embedding=None,
             time_range=None,
             children=l2_children,
         )
