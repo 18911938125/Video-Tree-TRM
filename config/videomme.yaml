@@ -1,0 +1,55 @@
+tree:
+  max_paragraphs_per_l2: 5
+  l1_segment_duration: 600.0           # L1: 每段 10 分钟（长视频适配）
+  l2_clip_duration: 60.0               # L2: 每 clip 60 秒
+  l3_fps: 1.0                          # L3: 1 帧/秒
+  l2_representative_frames: 10         # L2 VLM 描述用的代表帧数
+  cache_dir: "/data/videomme/trees"    # 树索引缓存目录（绝对路径）
+
+embed:
+  backend: "local"                     # "local"（sentence-transformers）| "remote"
+  model_name: "BAAI/bge-base-zh-v1.5"
+  embed_dim: 2560
+  device: "cuda"
+  api_key: ""
+  api_url: ""
+
+llm:
+  backend: "qwen"
+  model: "qwen-plus"
+  api_url: "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions"
+  max_tokens: 256
+  temperature: 0.1
+  # api_key: 从 .env 加载
+
+vlm:
+  backend: "qwen"
+  model: "qwen-vl-plus"
+  api_url: "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions"
+  max_tokens: 256
+  temperature: 0.1
+  # api_key: 从 .env 加载
+
+retriever:
+  embed_dim: 2560
+  num_heads: 4
+  L_layers: 2
+  L_cycles: 4
+  max_rounds: 5
+  ffn_expansion: 2.0
+  checkpoint: null
+
+train:
+  lr: 1.0e-4
+  weight_decay: 1.0e-5
+  batch_size: 1
+  max_epochs_phase1: 30
+  max_epochs_phase2: 20
+  nav_loss_weight: 1.0
+  act_loss_weight: 0.1
+  act_lambda_step: 0.1
+  act_gamma: 0.9
+  eval_interval: 5
+  save_dir: "/data/videomme/checkpoints"
+  dataset: "videomme"
+  dataset_path: "/data/videomme/annotations"
