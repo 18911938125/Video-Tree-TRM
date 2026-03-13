@@ -196,7 +196,7 @@ Pipeline:
 输入: 长视频文件路径 或 YouTube URL
 输出: TreeIndex（全部 embedding=None）
 
-Pipeline:
+Pipeline（ThreadPoolExecutor 异步事件循环）:
   Step 0 — 输入类型判断
      本地文件: 直接使用 OpenCV 读取
      YouTube URL: yt-dlp -g 获取 CDN 直链 + yt-dlp --dump-json 获取时长
@@ -207,21 +207,22 @@ Pipeline:
      固定步长 l1_segment_duration=600s → L1 区间列表
      每个 L1 区间 → 等分 l2_clip_duration=60s → L2 clips
 
-  Step 2 — L2 先行（稀疏代表帧）
-     每个 L2 clip: 均匀 seek l2_representative_frames=10 个时间戳提取帧
-     （稀疏采样，独立于 l3_fps，直接 cv2 seek，不做全量提取）
-     → VLM(10帧, "描述片段核心内容") → 1-2句描述
+  Step 2 — 预计算任务图
+     收集所有 L2 任务 + 记录每个 L1 的 L2 数量（l2_counts）
 
-  Step 3 — L3 向下（密集帧 + L2 上下文）
-     每个 L2 clip: 按 l3_fps=1.0 fps 提取全量帧
-     帧文件持久化到 {cache_dir}/frames/{source_id}/（缓存复用）
-     主路径: VLM(全部帧, prompt) → JSON 数组（每帧1-2句）
-     降级路径: JSON 解析失败 → 逐帧 VLM 调用
+  Step 3 — 一次性提交所有 L2 任务（非阻塞）
+     ThreadPoolExecutor(max_workers=concurrency)
+     每个 L2 clip: 均匀 seek l2_representative_frames=10 帧 → VLM → 1-2句描述
 
-  Step 4 — L1 向上聚合（纯文本）
-     每个 L1: vlm.chat(拼接所有 L2 描述) → 2-3句摘要
+  Step 4 — 事件循环（cfwait FIRST_COMPLETED）
+     L2 完成 → 立即提交 L3 任务（_build_l3_task，线程安全）
+       L3: 按 l3_fps 提取全量帧（持久化缓存），注入 L2 上下文，VLM 批量帧描述（JSON）
+           降级路径: JSON 解析失败 → 逐帧 VLM 调用
+     L3 完成 → 检查该 L1 的所有 L2 是否就绪 → 触发 L1 任务
+       L1: 拼接所有 L2 描述 → vlm.chat() → 2-3句摘要
+     主线程单线程操作 l1_l2_buckets，无竞争，无需 Lock
 
-  Step 5 — 组装 TreeIndex（写 IndexMeta + 日志）
+  Step 5 — 有序重建 l1_nodes，组装 TreeIndex（写 IndexMeta + 日志）
 
   ⚠ 延迟 Embedding: 所有节点 embedding=None
      首次检索时由 Pipeline._embed_tree() → tree.embed_all() 统一填充

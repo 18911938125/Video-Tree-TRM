@@ -432,13 +432,18 @@ class VideoTreeBuilder:
           URL 模式: _resolve_stream() 获取 CDN 直链，_get_video_duration() 获取时长
           本地模式: OpenCV 直接读取
 
-        完整构建流程:
+        完整构建流程（ThreadPoolExecutor 异步事件循环）:
           Step 0: URL 处理（若 video_path 为 URL）
           Step 1: _segment_video  → L1 时间区间列表
-          Step 2: L2 先行 → 稀疏代表帧 VLM 描述（不含 embedding）
-          Step 3: L3 向下 → 注入 L2 上下文，VLM 批量帧描述（JSON，不含 embedding）
-          Step 4: L1 向上 → 聚合 L2 描述（不含 embedding）
-          Step 5: 组装 TreeIndex（全部 embedding=None）
+          Step 2: 收集全局 L2 任务列表，预计算每个 L1 的 L2 数量
+          Step 3: ThreadPoolExecutor(max_workers=concurrency) 一次性提交所有 L2 任务（非阻塞）
+          Step 4: 事件循环（cfwait FIRST_COMPLETED）：
+                  L2 完成 → 立即提交 L3 任务（_build_l3_task）
+                  L3 完成 → 检查 L1 就绪 → 立即提交 L1 任务
+                  L1 完成 → 收集结果
+          Step 5: 有序重建 l1_nodes，组装 TreeIndex（全部 embedding=None）
+
+        主线程单线程操作 l1_l2_buckets，无竞争，无需 Lock。
         """
 
     # ── URL 流式辅助方法（静态方法）──
@@ -493,6 +498,18 @@ class VideoTreeBuilder:
         - 降级路径: JSON 解析失败时逐帧调用
         所有节点 embedding=None"""
 
+    def _build_l3_task(
+        self,
+        video_path: str,
+        l2_node: L2Node,
+        clip_range: Tuple[float, float],
+        source_id: str,
+        l1_i: int,
+        l2_j: int,
+    ) -> L2Node:
+        """L3 线程任务单元：提取帧 + _build_l3_video，返回已填充 children 的 L2Node。
+        由事件循环在 L2 完成后自动提交（非阻塞），线程安全（内部独立持有 VideoCapture）。"""
+
     def _call_vlm_batch(self, prompt, frame_paths, n, l1_i, l2_j) -> List[str]:
         """批量 VLM 调用 + JSON 解析失败时降级逐帧"""
 
@@ -514,6 +531,7 @@ class VideoTreeBuilder:
 | `l3_fps` | 1.0 | L3 帧提取速率（帧/秒） |
 | `l2_representative_frames` | 10 | L2 稀疏代表帧数 |
 | `cache_dir` | `cache/trees` | 帧图像持久化目录 |
+| `concurrency` | 16 | 视频内 L2/L3 任务并发数（ThreadPoolExecutor max_workers） |
 
 **依赖**: tree_index, embeddings, llm_client, opencv-python（帧提取）
 
