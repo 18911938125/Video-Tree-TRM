@@ -33,9 +33,11 @@ import json
 import os
 import re
 import subprocess
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor
+from concurrent.futures import wait as cfwait
 from datetime import datetime
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import cv2
 import numpy as np
@@ -211,7 +213,7 @@ class VideoTreeBuilder:
     # ------------------------------------------------------------------
 
     def build(self, video_path: str) -> TreeIndex:
-        """将长视频构建为三层 TreeIndex。
+        """将长视频构建为三层 TreeIndex（异步事件循环模式）。
 
         参数:
             video_path: 视频文件路径（.mp4/.avi/.mkv 等）或 YouTube URL。
@@ -221,12 +223,16 @@ class VideoTreeBuilder:
             三层 TreeIndex 对象。
 
         实现细节:
-            Step 0: 若 video_path 为 URL，获取 CDN 直链（stream_url）和时长（duration_hint）
-            Step 1: _segment_video → List[Tuple[float, float]]（L1 时间区间）
-            Step 2: L2 先行 — 每个 L2 clip 用 VLM 生成描述 + 嵌入
-            Step 3: L3 向下 — 注入 L2 上下文，VLM 批量帧描述 + 嵌入
-            Step 4: L1 向上 — 聚合 L2 描述，LLM 生成 L1 摘要 + 嵌入
-            Step 5: 组装 TreeIndex 并写入日志
+            采用事件循环 + Future 链式触发（非阻塞）：
+            Step 1: _segment_video → L1 区间列表
+            Step 2: 收集所有 L2 任务，预计算每个 L1 的 L2 数量
+            Step 3: 一次性提交所有 L2 任务（非阻塞，max_workers=concurrency）
+            Step 4: 事件循环（cfwait FIRST_COMPLETED）：
+                    L2 完成 → 立即提交 L3 任务
+                    L3 完成 → 检查 L1 就绪 → 立即提交 L1 任务
+                    L1 完成 → 收集结果
+            Step 5: 有序重建 l1_nodes，组装 TreeIndex
+            主线程单线程操作 l1_l2_buckets，无竞争，无需 Lock。
         """
         # Phase 0: URL vs 本地文件处理
         if self._is_url(video_path):
@@ -239,46 +245,99 @@ class VideoTreeBuilder:
             duration_hint = None
             log_msg("INFO", "开始构建视频树索引", video_path=video_path)
 
-        # 计算帧目录用的短标识符（从原始 video_path 而非 stream_url 提取）
         source_id = self._source_stem(video_path)
 
-        # Phase 1: 时间切分 → L1 区间列表
+        # Phase 1: 时间切分
         l1_ranges = self._segment_video(stream_url, duration_hint=duration_hint)
         ensure(len(l1_ranges) > 0, "视频时间切分结果为空")
         log_msg("INFO", "视频切分完成", l1_count=len(l1_ranges))
 
-        l1_nodes: List[L1Node] = []
-
+        # Phase 2: 收集全局 L2 任务列表 + 预计算每个 L1 的 L2 数量
+        all_l2_tasks: List[Tuple[int, int, str, Tuple[float, float]]] = []
+        l2_counts: Dict[int, int] = {}
         for i, l1_range in enumerate(l1_ranges):
-            l2_clips = self._get_l2_clips(l1_range)
-            l2_nodes: List[L2Node] = []
+            clips = self._get_l2_clips(l1_range)
+            l2_counts[i] = len(clips)
+            for j, clip_range in enumerate(clips):
+                all_l2_tasks.append((i, j, f"l1_{i}_l2_{j}", clip_range))
 
-            for j, clip_range in enumerate(l2_clips):
-                l2_id = f"l1_{i}_l2_{j}"
+        # Phase 3 & 4: 异步事件循环（ThreadPoolExecutor + cfwait FIRST_COMPLETED）
+        # pending: Future → ("l2"|"l3"|"l1", *meta)
+        pending: Dict[Future, tuple] = {}
+        l1_l2_buckets: Dict[int, Dict[int, L2Node]] = {i: {} for i in range(len(l1_ranges))}
+        l1_nodes_result: Dict[int, L1Node] = {}
 
-                # Phase 2: L2 先行 — VLM 代表帧描述
-                l2_node = self._build_l2_video(stream_url, clip_range, l2_id, source_id=source_id)
+        pool = ThreadPoolExecutor(max_workers=self.config.concurrency)
 
-                # Phase 3: L3 向下 — 提取所有帧，注入 L2 上下文
-                all_frames = self._extract_frames(
-                    stream_url, clip_range, self.config.l3_fps, source_id=source_id
-                )
-                l3_nodes = self._build_l3_video(all_frames, l2_node.description, i, j)
-                l2_node.children = l3_nodes
-                l2_nodes.append(l2_node)
-                log_msg(
-                    "INFO",
-                    "L2 节点构建完成",
-                    l2_id=l2_id,
-                    l3_count=len(l3_nodes),
-                )
+        # 一次性提交所有 L2 任务（非阻塞）
+        for l1_i, l2_j, l2_id, clip_range in all_l2_tasks:
+            fut = pool.submit(
+                self._build_l2_video, stream_url, clip_range, l2_id, source_id
+            )
+            pending[fut] = ("l2", l1_i, l2_j, clip_range)
 
-            # Phase 4: L1 向上 — 聚合 L2 描述
-            l1_node = self._build_l1_video(l2_nodes, f"l1_{i}", l1_range)
-            l1_nodes.append(l1_node)
-            log_msg("INFO", "L1 节点构建完成", l1_id=f"l1_{i}", l2_count=len(l2_nodes))
+        log_msg(
+            "INFO",
+            "已提交全部 L2 任务（异步）",
+            total_l2=len(all_l2_tasks),
+            concurrency=self.config.concurrency,
+        )
 
-        # Phase 5: 组装 TreeIndex（embedding 延迟到 Pipeline.embed_all，此处为 None）
+        # 事件循环：监听完成 → 触发下游
+        while pending:
+            done, _ = cfwait(list(pending), return_when=FIRST_COMPLETED)
+            for fut in done:
+                kind, *meta = pending.pop(fut)
+
+                if kind == "l2":
+                    l1_i, l2_j, clip_range = meta
+                    l2_node: L2Node = fut.result()
+                    # L2 完成 → 立即提交 L3 任务（非阻塞）
+                    l3_fut = pool.submit(
+                        self._build_l3_task,
+                        stream_url, l2_node, clip_range, source_id, l1_i, l2_j,
+                    )
+                    pending[l3_fut] = ("l3", l1_i, l2_j)
+                    log_msg(
+                        "INFO", "L2 VLM 完成，已触发 L3 任务",
+                        l2_id=f"l1_{l1_i}_l2_{l2_j}",
+                    )
+
+                elif kind == "l3":
+                    l1_i, l2_j = meta
+                    completed_l2: L2Node = fut.result()  # L2Node（含 children）
+                    l1_l2_buckets[l1_i][l2_j] = completed_l2
+                    log_msg(
+                        "INFO", "L3 完成",
+                        l2_id=f"l1_{l1_i}_l2_{l2_j}",
+                        l3_count=len(completed_l2.children),
+                    )
+                    # 检查该 L1 的所有 L2 是否就绪 → 触发 L1
+                    if len(l1_l2_buckets[l1_i]) == l2_counts[l1_i]:
+                        ordered_l2 = [
+                            l1_l2_buckets[l1_i][j] for j in range(l2_counts[l1_i])
+                        ]
+                        l1_fut = pool.submit(
+                            self._build_l1_video,
+                            ordered_l2, f"l1_{l1_i}", l1_ranges[l1_i],
+                        )
+                        pending[l1_fut] = ("l1", l1_i)
+                        log_msg("INFO", "L1 触发", l1_id=f"l1_{l1_i}")
+
+                elif kind == "l1":
+                    (l1_i,) = meta
+                    l1_nodes_result[l1_i] = fut.result()
+                    log_msg(
+                        "INFO", "L1 节点构建完成",
+                        l1_id=f"l1_{l1_i}",
+                        l2_count=l2_counts[l1_i],
+                    )
+
+        pool.shutdown(wait=False)
+
+        # Phase 5: 有序重建 l1_nodes，组装 TreeIndex
+        l1_nodes: List[L1Node] = [l1_nodes_result[i] for i in range(len(l1_ranges))]
+
         metadata = IndexMeta(
             source_path=video_path,
             modality="video",
@@ -588,6 +647,39 @@ class VideoTreeBuilder:
                 )
             )
         return nodes
+
+    def _build_l3_task(
+        self,
+        video_path: str,
+        l2_node: L2Node,
+        clip_range: Tuple[float, float],
+        source_id: str,
+        l1_i: int,
+        l2_j: int,
+    ) -> L2Node:
+        """L3 线程任务：提取帧 + 批量 VLM 帧描述，将 l3_nodes 赋给 l2_node.children。
+
+        参数:
+            video_path: 视频文件路径或 CDN 流式 URL。
+            l2_node: 已构建的 L2 节点（description 已就绪）。
+            clip_range: L2 clip 时间区间 (start, end)，单位秒。
+            source_id: 帧缓存目录名。
+            l1_i: 父 L1 索引（用于 L3 节点 ID 生成）。
+            l2_j: 父 L2 索引（用于 L3 节点 ID 生成）。
+
+        返回:
+            已填充 children 的 L2Node（供事件循环收集）。
+
+        实现细节:
+            作为独立线程任务单元，内部独立持有 VideoCapture，线程安全。
+            由 build() 事件循环在 L2 任务完成后自动提交（非阻塞）。
+        """
+        all_frames = self._extract_frames(
+            video_path, clip_range, self.config.l3_fps, source_id=source_id
+        )
+        l3_nodes = self._build_l3_video(all_frames, l2_node.description, l1_i, l2_j)
+        l2_node.children = l3_nodes
+        return l2_node
 
     def _call_vlm_batch(
         self,

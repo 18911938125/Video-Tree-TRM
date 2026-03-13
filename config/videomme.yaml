@@ -5,6 +5,7 @@ tree:
   l3_fps: 1.0                          # L3: 1 帧/秒
   l2_representative_frames: 10         # L2 VLM 描述用的代表帧数
   cache_dir: "data/videomme/trees"     # 树索引缓存目录（相对项目根目录）
+  concurrency: 16                      # 视频内 L2/L3 任务并发数
 
 embed:
   backend: "local"                     # CPU 本地运行，无需远程嵌入服务

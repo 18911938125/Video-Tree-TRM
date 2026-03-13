@@ -5,6 +5,7 @@ tree:
   l3_fps: 1.0
   l2_representative_frames: 10
   cache_dir: "cache/trees"
+  concurrency: 16
 
 embed:
   backend: "local"                    # "local" (sentence-transformers) | "remote" (OpenAI 兼容 API)
